@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
-"""生成修订版 MiniMax-H3-Image Colab 笔记本。
+"""生成 MiniMax-H3-Image Colab 笔记本 v2（明确命名的新版本）。
 
 按 Qwen-Image-2.1 部署中已验证的工程修复点重写：
   官方 PyPI / 官方 HuggingFace、ComfyUI 新依赖校验、精选量化权重、
   下载完整性校验、ComfyUI 端口就绪轮询、cloudflared 重试与自检、Named Tunnel 可选。
+v2 追加：CUDA 硬门禁 / 过滤 torch 家族防 CPU wheel / 8188 隧道精确匹配 /
+  Named Tunnel 公网自检 / 逐条修订清单。
 """
 import json
 
 OUT = [
-    '/Users/apple/WorkBuddy/2026-11-15-20-56-30/MiniMax-H3-Image_Colab.ipynb',
-    '/Users/apple/WorkBuddy/2026-11-15-20-29-14/notebooks/MiniMax-H3-Image_Colab.ipynb',
+    '/Users/apple/WorkBuddy/2026-11-15-20-56-30/MiniMax-H3-Image_Colab_v2.ipynb',
+    '/Users/apple/WorkBuddy/2026-11-15-20-29-14/notebooks/MiniMax-H3-Image_Colab_v2.ipynb',
 ]
 
 nb = {
@@ -33,7 +35,7 @@ def code(s):
                         'outputs': [], 'source': [l + '\n' for l in s.strip('\n').split('\n')]})
 
 md(r'''
-# MiniMax H3-Image · Google Colab（T4 16GB 修订版）
+# MiniMax H3-Image · Google Colab（T4 16GB · v2 修订版）
 
 **模型**：MiniMax H3-Image，33.1B 参数扩散 Transformer，6 步采样、无 CFG、不接受 negative prompt，
 原生 4096×4096（16MP），最多 16 张参考图。ComfyUI **v0.45.0+** 已原生支持，
@@ -53,6 +55,26 @@ T4 16GB 只能用 **W4A8 量化 DiT ≈11.7 GB** + `qwen3.5-9B W4A8` 文本编�
 - `HF_ENDPOINT` 原来被设成裸域名（少 `https://`），会让 `huggingface_hub` 拼错 URL；本版直接清掉，只用官方源。
 - cloudflared 加 `--no-autoupdate`、域名抓取重试、DNS 未生效重试、`/` 与 `/system_stats` 自检；可选固定私有域名。
 - 旧说明里的 `vyrekai/minimax-h3-image-comfyui-workflows` **GitHub 上不存在（404）**；改用 ComfyUI 内置模板。
+
+## v2 逐条修复清单（对应审查时指出的问题）
+
+| # | 原问题 | v2 处理 |
+|---|---|---|
+| 1 | 按「文件名含 16」挑权重，实际文件名没有 16，退化成下载 BF16 37 GB + `text_encoders/` 全部 46 GB | 运行时列 HF API 文件树，按 `w4a8` 优先精选 DiT + `qwen3.5-9B W4A8` 文本编码器 + VAE，约 20 GB |
+| 2 | 清华 pip 源漏装 2026 新包，报 `cannot import name 'ck' from comfy.quant_ops` | 全量装官方 `pypi.org` 的 requirements，校验 `comfy_kitchen` / `comfy_aimdo` / `ck`，缺失自动补装 |
+| 3 | `HF_ENDPOINT` 被设成裸域名（少 `https://`），镜像站常未同步新仓库 | 清掉 `HF_ENDPOINT`，只用 `huggingface.co` |
+| 4 | 工作流仓库 `vyrekai/minimax-h3-image-comfyui-workflows` GitHub 404 | 改用 ComfyUI v0.45.0+ 内置模板 + `Export (API Format)` |
+| 5 | 宣称 4K / 16MP 匹配 16G 显存，实测必然 OOM | 明确 T4 只跑 W4A8 组合，先 1024×1024 / 2048×2048，4K 需 24GB+ 显卡 |
+| 6 | `local_dir_use_symlinks=False` 新版已弃用、下载不校验大小、0 字节当成功 | 用 `hf_hub_download(local_dir=...)`，比对 HF API 返回的 size，不完整删掉重下 |
+| 7 | 启动只 `sleep(10)`、不轮询端口、重复运行会起多个实例 | 端口轮询 60×3s、日志覆盖写、检测到 8188 被占用时提示可能是另一个 Colab 会话 |
+| 8 | cloudflared 缺 `--no-autoupdate`、域名只抓一次、不自检、DNS 未生效直接失败 | 40 次抓域名、`/` 与 `/system_stats` 各 3 次重试自检 |
+| 9 | `TUNNEL_URL` 可能未定义导致下一格 `NameError`；`wait_completion` 不看 status、超时 300s 太短 | 安全取 `globals().get`、检查 `/prompt` 返回与 history status、超时 900s、自动保存输出图片 |
+| 10 | Drive 备份 `cp -r` 整个 models、目标目录未创建、缺 import | 只拷本次 `WANTED` 清单、`os.makedirs`、独立 import |
+
+**v2 追加（Qwen 侧实测经验）**
+- 官方 `requirements.txt` 含无版本约束的 `torch / torchvision / torchsde`，从 PyPI 重装可能把 Colab 预装的 `torch+cu130` 换成 CPU wheel，导致 `AssertionError: Torch not compiled with CUDA enabled`。v2 过滤 torch 家族、装完用子进程实测 CUDA，并在环境检查与启动 ComfyUI 前加硬门禁。
+- quick tunnel 按 `--url http://localhost:8188` 精确匹配，不会误复用 Qwen 笔记本 8010 那条隧道的域名。
+- Named Tunnel 模式也会设置 `TUNNEL_URL` 并做公网自检，下一格健康检查走固定域名。
 
 > 权重附带 MiniMax-H3-Image Community License，对部署地区与商用有限制，请自行确认。
 
@@ -86,6 +108,14 @@ for cmd in (['nvidia-smi'], ['df', '-h', '/content']):
     except Exception as e:
         print('执行失败:', repr(e))
 
+# 硬门禁：CPU 运行时不要继续往下跑，ComfyUI 会在 comfy/model_management.py 崩
+import torch as _t
+if _t.version.cuda is None or not _t.cuda.is_available():
+    raise RuntimeError('当前 torch=%s 无 CUDA 支持（CPU 运行时，或 torch 被 pip 换成 CPU 版）。'
+                       '先 Runtime → Change runtime type 选 T4 GPU 并重新连接；'
+                       '若已选 GPU 仍报错，运行 notebooks/fix_cuda_torch_cell.py' % _t.__version__)
+print('✅ CUDA 检查通过:', _t.__version__, '|', _t.cuda.get_device_name(0))
+
 print('\n提示：先选 Runtime -> Change runtime type -> T4 GPU；本版需下载约 20 GB 权重，确认 /content 空间充足。')
 ''')
 
@@ -113,7 +143,23 @@ head = subprocess.run(['git', '-C', COMFY, 'rev-parse', '--short', 'HEAD'],
 print('ComfyUI HEAD:', head, '（需 v0.45.0+ 才原生支持 MiniMax H3-Image）')
 
 # 全量安装官方 requirements（不要只装几个包，也不要改用清华源）
-pip_install('-r', COMFY + '/requirements.txt')
+# 但 torch / torchvision / torchsde 必须剔除：官方 requirements 里它们无版本约束，
+# 从 PyPI 重装可能把 Colab 预装的 torch+cu130 换成 CPU wheel，
+# 触发 AssertionError: Torch not compiled with CUDA enabled（Qwen 版实测踩过）
+_src = open(COMFY + '/requirements.txt', encoding='utf-8').read().splitlines()
+_keep = [l for l in _src if l.strip().lower().split('==')[0].split('>=')[0].split('<')[0]
+         not in ('torch', 'torchvision', 'torchaudio', 'torchsde')]
+open('/content/requirements_notorch.txt', 'w', encoding='utf-8').write('\n'.join(_keep))
+print('已过滤 torch 家族 %d 行，保留 %d 行依赖' % (len(_src) - len(_keep), len(_keep)))
+pip_install('-r', '/content/requirements_notorch.txt')
+
+# 子进程实测 torch（当前 kernel 可能缓存旧模块，子进程才反映磁盘上的真实版本）
+chk_t = subprocess.run([sys.executable, '-c',
+    'import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())'],
+    capture_output=True, text=True)
+print('torch 实测:', (chk_t.stdout or chk_t.stderr).strip())
+if 'True' not in chk_t.stdout:
+    raise RuntimeError('torch 无 CUDA 支持：先切 T4 GPU，或运行 notebooks/fix_cuda_torch_cell.py')
 
 # 依赖校验：缺 ck 会报 ImportError: cannot import name 'ck' from comfy.quant_ops
 CHECK = [sys.executable, '-c',
@@ -261,6 +307,10 @@ COMFY, PORT = '/content/ComfyUI', 8188
 LOG, TLOG, CF = '/content/comfyui.log', '/content/cloudflared.log', '/usr/local/bin/cloudflared'
 USE_NAMED_TUNNEL = False    # 想用固定域名 comfy.gmhqyj.ccwu.cc 时改 True，见下方说明
 
+import torch as _t6
+if _t6.version.cuda is None or not _t6.cuda.is_available():
+    raise RuntimeError('torch 无 CUDA：先切 T4 GPU / 运行 fix_cuda_torch_cell.py，否则 ComfyUI 必崩')
+
 def port_open(p):
     s = socket.socket(); s.settimeout(1)
     try:
@@ -269,6 +319,20 @@ def port_open(p):
         return False
     finally:
         s.close()
+
+def selfcheck(base):
+    """公网地址自检：新 quick tunnel 域名 DNS 传播需要 30-60 秒，失败重试 3 次"""
+    for path in ['/', '/system_stats']:
+        for attempt in range(3):
+            try:
+                with urllib.request.urlopen(base + path, timeout=45) as r:
+                    print('  %-14s HTTP %s | %d bytes' % (path, r.status, len(r.read())))
+                break
+            except Exception as e:
+                if attempt == 2:
+                    print('  %-14s 自检失败: %r（DNS 未生效，等 30-60 秒重跑本 Cell）' % (path, e))
+                else:
+                    time.sleep(10)
 
 if port_open(PORT):
     print('⚠️ 8188 已被占用：可能是另一个 Colab 会话的 ComfyUI。本 Cell 不重复启动，隧道指向现有服务。')
@@ -305,14 +369,20 @@ if USE_NAMED_TUNNEL:
     nlog = open('/content/cloudflared_named.log', 'w')
     subprocess.Popen([CF, 'tunnel', '--no-autoupdate', 'run', '--token', TOKEN],
                      stdout=nlog, stderr=subprocess.STDOUT, start_new_session=True)
-    print('>>> 固定域名: https://comfy.gmhqyj.ccwu.cc  (Public Hostname -> localhost:8188)')
+    TUNNEL_URL = 'https://comfy.gmhqyj.ccwu.cc'
+    print('>>> 固定域名:', TUNNEL_URL, '(Public Hostname -> localhost:8188)')
+    print('    等待云端 ingress 下发 ...')
+    time.sleep(20)
+    selfcheck(TUNNEL_URL)
 else:
-    running = subprocess.run("ps -eo args | grep -c '[c]loudflared tunnel.*--url'",
-                             shell=True, capture_output=True, text=True).stdout.strip()
-    if running == '0':
-        tlog = open(TLOG, 'w')
-        subprocess.Popen([CF, 'tunnel', '--no-autoupdate', '--url', 'http://localhost:%d' % PORT],
-                         stdout=tlog, stderr=subprocess.STDOUT, start_new_session=True)
+    # 精确清理指向 8188 的旧隧道：绝不能复用 Qwen 笔记本 8010 那条的域名
+    subprocess.run("ps -eo pid,args | grep '[c]loudflared.*--url http://localhost:%d' "
+                   "| awk '{print $1}' | xargs -r kill" % PORT,
+                   shell=True)
+    time.sleep(1)
+    tlog = open(TLOG, 'w')
+    subprocess.Popen([CF, 'tunnel', '--no-autoupdate', '--url', 'http://localhost:%d' % PORT],
+                     stdout=tlog, stderr=subprocess.STDOUT, start_new_session=True)
     TUNNEL_URL = None
     for _ in range(40):
         time.sleep(2)
@@ -321,18 +391,9 @@ else:
         if m:
             TUNNEL_URL = m[0]; break
     print('>>> ComfyUI 公网地址:', TUNNEL_URL or '未取到域名，看 /content/cloudflared.log')
+    print('    （重跑本 Cell 会更换临时域名；要固定域名请设 USE_NAMED_TUNNEL=True）')
     if TUNNEL_URL:
-        for path in ['/', '/system_stats']:
-            for attempt in range(3):
-                try:
-                    with urllib.request.urlopen(TUNNEL_URL + path, timeout=45) as r:
-                        print('  %-14s HTTP %s | %d bytes' % (path, r.status, len(r.read())))
-                    break
-                except Exception as e:
-                    if attempt == 2:
-                        print('  %-14s 自检失败: %r（新域名 DNS 未生效，等 30-60 秒重跑本 Cell）' % (path, e))
-                    else:
-                        time.sleep(10)
+        selfcheck(TUNNEL_URL)
 ''')
 
 code(r'''
@@ -416,6 +477,13 @@ md(r'''
 9. **本机打不开固定域名**：部分网络会在 TLS 握手阶段阻断 `*.gmhqyj.ccwu.cc`，
    用临时 `trycloudflare.com` 域名或换网络；两个域名都无鉴权，建议加 Cloudflare Access。
 10. **保存权重**：会话结束后 `/content` 会清空，需要长期保留就运行第 5 格（约 20 GB）。
+11. **ComfyUI 报 `Torch not compiled with CUDA enabled`**：说明当前会话是 CPU 运行时，或 torch 被 pip 换成 CPU wheel，
+    不是缺 `comfy-aimdo` / `comfy-kitchen`（日志里 `eager backend available` 反而说明它们已装好）。
+    先 `Runtime → Change runtime type → T4 GPU` 并重连 VM；若已有 GPU 仍报错，运行仓库里的
+    `notebooks/fix_cuda_torch_cell.py`。v2 已在环境检查、依赖安装、启动 ComfyUI 三处加 CUDA 硬门禁，
+    不会再白跑 20 GB 下载。
+12. **隧道域名串到 8010**：v2 只按 `--url http://localhost:8188` 精确匹配清理/新建 quick tunnel；
+    `USE_NAMED_TUNNEL=True` 时也会设置 `TUNNEL_URL` 并自检固定域名，下一格健康检查可直接用公网地址。
 ''')
 
 for path in OUT:
