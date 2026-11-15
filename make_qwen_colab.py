@@ -18,6 +18,10 @@ def md(*lines):
 def code(*lines):
     nb["cells"].append({"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [], "source": [l + "\n" for l in lines]})
 
+def code_raw(src):
+    """整段原始字符串 -> 逐行 code Cell（长 Cell 更好维护）"""
+    code(*src.strip("\n").split("\n"))
+
 # ---------------- Cell 1: 说明与选型 ----------------
 md(
     "# Qwen-Image-2.1-Turbo 在 Google Colab 上运行",
@@ -257,66 +261,113 @@ code(
     "    print(open('/content/qwen_api.log').read()[-2000:])",
 )
 
-# ---------------- Cell 9: cloudflared 公网隧道 ----------------
-code(
-    "import subprocess, re, time, os, json, urllib.request",
-    "",
-    "TUNNEL_PORT = 8010   # 改成 8188 即直连 ComfyUI 原生 API（不需要 FastAPI 这层）",
-    "PREFER_PRIVATE_DOMAIN = True   # 先探测固定域名，通了就直接用，不再新开 quick tunnel",
-    "PRIVATE_API = 'https://qwythos.gmhqyj.ccwu.cc'",
-    "",
-    "# Named Tunnel 由「可选 Cell 11」或另一个已连接的会话提供；这里只探测，不需要 token",
-    "def private_ok():",
-    "    try:",
-    "        with urllib.request.urlopen(PRIVATE_API + '/health', timeout=15) as r:",
-    "            return r.status == 200 and json.loads(r.read()).get('ok') is True",
-    "    except Exception:",
-    "        return False",
-    "",
-    "PRIVATE_OK = False",
-    "if PREFER_PRIVATE_DOMAIN:",
-    "    for _ in range(3):",
-    "        if private_ok():",
-    "            PRIVATE_OK = True",
-    "            break",
-    "        time.sleep(5)",
-    "    if PRIVATE_OK:",
-    "        print('✅ 私有域名已就绪（Named Tunnel 在线）:', PRIVATE_API)",
-    "        print('>>> OpenAI 兼容接口:', PRIVATE_API + '/v1/images/generations')",
-    "    else:",
-    "        print('私有域名不可用（Named Tunnel 未连接 / Dashboard 未配 Public Hostname），回退 quick tunnel')",
-    "",
-    "if not os.path.exists('/usr/local/bin/cloudflared'):",
-    "    subprocess.run(['wget', '-q',",
-    "        'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64',",
-    "        '-O', '/usr/local/bin/cloudflared'], check=True)",
-    "    subprocess.run(['chmod', '+x', '/usr/local/bin/cloudflared'], check=True)",
-    "",
-    "running = subprocess.run(\"ps -eo args | grep -c '[c]loudflared tunnel'\", shell=True,",
-    "                         capture_output=True, text=True).stdout.strip()",
-    "if running != '0' or PRIVATE_OK:",
-    "    if PRIVATE_OK:",
-    "        print('固定域名由 Named Tunnel 提供，跳过新建 quick tunnel；临时域名仍可作回退')",
-    "    else:",
-    "        print('已有 cloudflared 隧道进程，保持原公网域名不变；后端恢复后自动解除 502')",
-    "else:",
-    "    tlog = open('/content/cloudflared.log', 'w')",
-    "    subprocess.Popen(['cloudflared', 'tunnel', '--no-autoupdate', '--url', f'http://localhost:{TUNNEL_PORT}'],",
-    "                     stdout=tlog, stderr=subprocess.STDOUT, start_new_session=True)",
-    "    public = None",
-    "    for _ in range(40):",
-    "        time.sleep(2)",
-    "        txt = open('/content/cloudflared.log').read()",
-    "        m = re.findall(r'https://[a-zA-Z0-9-]+\\.trycloudflare\\.com', txt)",
-    "        if m:",
-    "            public = m[0]",
-    "            break",
-    "    print('>>> 公网地址:', public)",
-    "    if TUNNEL_PORT == 8010 and public:",
-    "        print('>>> OpenAI 兼容接口:', public + '/v1/images/generations')",
-    "    elif public:",
-    "        print('>>> ComfyUI 原生 API:', public + '/system_stats')",
-)
+# ---------------- Cell 9: cloudflared 公网隧道（按 Secret 自动二选一） ----------------
+code_raw(r'''
+import subprocess, re, time, os, json, base64, urllib.request
+
+TUNNEL_PORT = 8010   # 改成 8188 即直连 ComfyUI 原生 API（不需要 FastAPI 这层）
+CF = '/usr/local/bin/cloudflared'
+API_HOST = 'https://qwythos.gmhqyj.ccwu.cc'      # Public Hostname -> localhost:8010
+COMFY_HOST = 'https://comfy.gmhqyj.ccwu.cc'      # Public Hostname -> localhost:8188
+PRIVATE_HOST = API_HOST if TUNNEL_PORT == 8010 else COMFY_HOST
+PROBE_PATH = '/health' if TUNNEL_PORT == 8010 else '/system_stats'
+
+if not os.path.exists(CF):
+    subprocess.run(['wget', '-q',
+        'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64',
+        '-O', CF], check=True)
+    subprocess.run(['chmod', '+x', CF], check=True)
+
+# ---- 1) 有 Secret 用私有域名，没有（或本笔记本未授权）走 trycloudflare ----
+TOKEN = None
+try:
+    from google.colab import userdata
+    TOKEN = userdata.get('CF_TUNNEL_TOKEN')
+except Exception as e:
+    print('未读取到 Secret CF_TUNNEL_TOKEN（%s）→ 走 quick tunnel' % type(e).__name__)
+if not TOKEN:
+    print('未配置 Secret CF_TUNNEL_TOKEN → 走 quick tunnel')
+else:
+    try:
+        meta = json.loads(base64.b64decode(TOKEN))
+        assert meta.get('a') and meta.get('t') and meta.get('s'), 'token 缺字段'
+        print('检测到 Secret CF_TUNNEL_TOKEN | Tunnel ID:', meta['t'])
+    except Exception as e:
+        print('Secret 不是有效的隧道 token（%r）→ 走 quick tunnel' % e)
+        TOKEN = None
+
+def quick_tunnel():
+    """无 Secret 或私有域名不可用：开 quick tunnel，拿 trycloudflare.com 临时域名"""
+    cmd = "ps -eo args | grep -c '[c]loudflared.*--url http://localhost:%d'" % TUNNEL_PORT
+    running = subprocess.run(cmd, shell=True, capture_output=True, text=True).stdout.strip()
+    log_path = '/content/cloudflared.log'
+    if running != '0' and os.path.exists(log_path):
+        m = re.findall(r'https://[a-zA-Z0-9-]+\.trycloudflare\.com',
+                       open(log_path, errors='replace').read())
+        if m:
+            print('已有指向 %d 的 quick tunnel，沿用原域名' % TUNNEL_PORT)
+            return m[0]
+    tlog = open(log_path, 'w')
+    subprocess.Popen([CF, 'tunnel', '--no-autoupdate', '--url',
+                      'http://localhost:%d' % TUNNEL_PORT],
+                     stdout=tlog, stderr=subprocess.STDOUT, start_new_session=True)
+    for _ in range(40):
+        time.sleep(2)
+        m = re.findall(r'https://[a-zA-Z0-9-]+\.trycloudflare\.com',
+                       open(log_path, errors='replace').read())
+        if m:
+            return m[0]
+    print('未取到临时域名，日志末尾：\n', open(log_path, errors='replace').read()[-800:])
+    return None
+
+def stop_named():
+    subprocess.run("ps -eo pid,args | grep '[c]loudflared tunnel.*run --token' "
+                   "| awk '{print $1}' | xargs -r kill", shell=True)
+
+def private_tunnel():
+    """有 Secret：接管 Named Tunnel，并验证固定域名是否真的可用"""
+    stop_named()
+    time.sleep(1)
+    log = open('/content/cloudflared_named.log', 'w')
+    p = subprocess.Popen([CF, 'tunnel', '--no-autoupdate', '--loglevel', 'info',
+                          'run', '--token', TOKEN],
+                         stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+    print('Named Tunnel PID:', p.pid, '| 等待云端下发 ingress ...')
+    for attempt in range(8):
+        time.sleep(5)
+        try:
+            with urllib.request.urlopen(PRIVATE_HOST + PROBE_PATH, timeout=20) as r:
+                body = r.read()
+            if TUNNEL_PORT == 8010 and json.loads(body).get('ok') is not True:
+                continue
+            print('✅ 私有域名验证通过:', PRIVATE_HOST + PROBE_PATH)
+            return True
+        except Exception as e:
+            if attempt == 7:
+                print('私有域名验证失败: %r' % e)
+    print('⚠️ 检查 Zero Trust → Public Hostname 与本地 %d 端口；先回退 quick tunnel' % TUNNEL_PORT)
+    return False
+
+PRIVATE_OK = bool(TOKEN) and private_tunnel()
+if PRIVATE_OK:
+    PUBLIC_BASE = PRIVATE_HOST
+    print('>>> 私有域名模式（Secret CF_TUNNEL_TOKEN 已启用）')
+    print('>>> 另一条固定域名:', COMFY_HOST if TUNNEL_PORT == 8010 else API_HOST)
+else:
+    if TOKEN:
+        stop_named()   # 私有域名验证失败，停掉 named 再走临时域名
+    PUBLIC_BASE = quick_tunnel()
+    print('>>> quick tunnel 模式（临时域名，每次重启会变）')
+
+if PUBLIC_BASE:
+    print('>>> 公网地址:', PUBLIC_BASE)
+    if TUNNEL_PORT == 8010:
+        print('>>> OpenAI 兼容接口:', PUBLIC_BASE + '/v1/images/generations')
+    else:
+        print('>>> ComfyUI 原生 API:', PUBLIC_BASE + '/system_stats')
+else:
+    print('❌ 没拿到公网地址，等 30-60 秒重跑本 Cell')
+''')
 
 # ---------------- Cell 10: 测试出图 ----------------
 code(
@@ -341,10 +392,12 @@ code(
 
 # ---------------- Cell 11: 可选：固定私有域名 ----------------
 md(
-    "# 可选：固定私有域名 + 8188 ComfyUI 访问",
+    "# 可选：手动接管固定域名 + 8188 ComfyUI 访问",
     "",
-    "主流程的 cloudflared 是 **quick tunnel**，域名每次重启 Colab 都会变。下面两个单元格启用固定域名，",
-    "并把 8188（ComfyUI Web UI / 原生 API）也单独暴露出来。",
+    "主流程的隧道 Cell 已**自动二选一**：Colab Secret 里有 `CF_TUNNEL_TOKEN` 且本笔记本已授权 →",
+    "自动启动 Named Tunnel，使用 `qwythos.gmhqyj.ccwu.cc` / `comfy.gmhqyj.ccwu.cc`；",
+    "没有 Secret（或本笔记本未授权、token 无效、固定域名验证失败）→ 自动开 quick tunnel，",
+    "使用 `trycloudflare.com` 临时域名。下面两个单元格只在需要**强制重启/接管**或本机打不开固定域名时用。",
     "",
     "| 域名 | 后端 | 用途 |",
     "| --- | --- | --- |",
@@ -361,7 +414,7 @@ md(
 
 # ---------------- Cell 12: 启动 Named Tunnel 并验证两个固定域名 ----------------
 code(
-    "# 固定私有域名：启动 Cloudflare Named Tunnel（token 从 Colab Secret 读取，笔记本内无明文）",
+    "# 强制接管/重启固定域名（主流程 Cell 已自动判断，一般不用再跑；token 从 Secret 读取，无明文）",
     "import os, subprocess, time, urllib.request",
     "from google.colab import userdata",
     "",
@@ -475,10 +528,13 @@ md(
     "- **公网域名 502？** 隧道活着但 8010 没监听。按顺序重跑「写入 qwen_api.py → 启动代理」两个 Cell；",
     "  用 `curl http://127.0.0.1:8010/health` 确认后端，再刷新公网域名。隧道进程保留则域名不变。",
     "- **不想要 FastAPI？** 把隧道 Cell 的 `TUNNEL_PORT` 改成 `8188`，直接用 ComfyUI 原生 `/prompt`、`/history`、`/view`。",
-    "- **为什么打印的是 trycloudflare.com 而不是私有域名？** 主流程隧道 Cell 默认开 quick tunnel；"
-    "固定域名由可选 Cell 11 的 Named Tunnel 提供。新版加了 `PREFER_PRIVATE_DOMAIN`："
-    "先探测 `qwythos.gmhqyj.ccwu.cc/health`，通了就直接打印固定域名并跳过新建 quick tunnel，"
-    "不通才回退临时域名。无论打印哪个，把客户端 `base_url` 设为 `https://qwythos.gmhqyj.ccwu.cc/v1` 即可走私有域名。",
+    "- **用私有域名还是临时域名？** 隧道 Cell 按 **Secret 是否存在**自动二选一："
+    "有 `CF_TUNNEL_TOKEN`（且本笔记本已授权、token 可解析）→ 启动 Named Tunnel，"
+    "验证 `qwythos.gmhqyj.ccwu.cc/health` 后打印固定域名与 `/v1/images/generations`；"
+    "没有 / 未授权 / token 无效 / 固定域名验证失败 → 自动回退 quick tunnel 打印 `trycloudflare.com` 临时域名。"
+    "Secret 是按笔记本授权的，用 GitHub 链接打开的新笔记本要重新开启访问权限。",
+    "- **两个会话抢同一隧道？** 同一 Named Tunnel token 只能一个 Colab 会话连接，同时连会 502 / 1033；"
+    "需要换会话时跑「强制接管」Cell 清掉旧连接。",
     "- **固定私有域名：** Cloudflare Named Tunnel 上已配两条 Public Hostname：",
     "  `qwythos.gmhqyj.ccwu.cc` → `localhost:8010`（OpenAI 兼容接口），",
     "  `comfy.gmhqyj.ccwu.cc` → `localhost:8188`（ComfyUI Web UI / 原生 API）。",
