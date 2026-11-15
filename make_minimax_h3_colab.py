@@ -9,7 +9,11 @@ v2 追加：CUDA 硬门禁 / 过滤 torch 家族防 CPU wheel / 8188 隧道精�
 """
 import json
 
+# 原文件名与 v2 文件名都写同一份内容：git 上「原来的版本」已被 v2 覆盖，
+# v2 链接继续保留可用，避免旧链接 404。
 OUT = [
+    '/Users/apple/WorkBuddy/2026-11-15-20-56-30/MiniMax-H3-Image_Colab.ipynb',
+    '/Users/apple/WorkBuddy/2026-11-15-20-29-14/notebooks/MiniMax-H3-Image_Colab.ipynb',
     '/Users/apple/WorkBuddy/2026-11-15-20-56-30/MiniMax-H3-Image_Colab_v2.ipynb',
     '/Users/apple/WorkBuddy/2026-11-15-20-29-14/notebooks/MiniMax-H3-Image_Colab_v2.ipynb',
 ]
