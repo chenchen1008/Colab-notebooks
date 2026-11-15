@@ -6,6 +6,7 @@
   下载完整性校验、ComfyUI 端口就绪轮询、cloudflared 重试与自检、Named Tunnel 可选。
 v2 追加：CUDA 硬门禁 / 过滤 torch 家族防 CPU wheel / 8188 隧道精确匹配 /
   Named Tunnel 公网自检 / 逐条修订清单。
+本次更新：隧道改为「有 Secret 用私有域名，没有走 trycloudflare」自动二选一（对齐 Qwen 版）。
 """
 import json
 
@@ -79,6 +80,23 @@ T4 16GB 只能用 **W4A8 量化 DiT ≈11.7 GB** + `qwen3.5-9B W4A8` 文本编�
 - 官方 `requirements.txt` 含无版本约束的 `torch / torchvision / torchsde`，从 PyPI 重装可能把 Colab 预装的 `torch+cu130` 换成 CPU wheel，导致 `AssertionError: Torch not compiled with CUDA enabled`。v2 过滤 torch 家族、装完用子进程实测 CUDA，并在环境检查与启动 ComfyUI 前加硬门禁。
 - quick tunnel 按 `--url http://localhost:8188` 精确匹配，不会误复用 Qwen 笔记本 8010 那条隧道的域名。
 - Named Tunnel 模式也会设置 `TUNNEL_URL` 并做公网自检，下一格健康检查走固定域名。
+
+## 本次更新：公网隧道自动二选一（对齐 Qwen 版）
+
+第 6 格不再需要手动设 `USE_NAMED_TUNNEL`，改为**以 Colab Secret 为准**：
+
+| 情况 | 走哪条 | 打印 |
+|---|---|---|
+| Secret `CF_TUNNEL_TOKEN_MINIMAX` 或 `CF_TUNNEL_TOKEN` 存在、已授权、token 可解析且固定域名验证通过 | Named Tunnel | `https://comfy.gmhqyj.ccwu.cc`（固定域名） |
+| 没配 Secret / 本笔记本未授权 / token 无效 / 固定域名验证失败 | quick tunnel | `trycloudflare.com` 临时域名 |
+
+读 Secret 后先 base64 校验 `a/t/s` 字段防误配，起 Named Tunnel 前会清掉同 token 的旧连接，
+随后 8×5s 轮询验证 `comfy.gmhqyj.ccwu.cc/system_stats`，失败自动回退 quick tunnel，不会卡死。
+
+> ⚠️ **同一个 Named Tunnel token 只能被一个 Colab 会话连接。** 若 Qwen 笔记本也在跑并用同一个
+> `CF_TUNNEL_TOKEN`，后跑的笔记本会接管固定域名、前一个会话的公网域名会断。推荐给 MiniMax
+> 单独建一条 Named Tunnel + 独立域名，把 Secret 命名为 `CF_TUNNEL_TOKEN_MINIMAX` 并修改
+> `PRIVATE_HOST`；或把 `ALLOW_SHARED_TOKEN` 设为 `False`，MiniMax 检测到共享 token 时直接走临时域名。
 
 > 权重附带 MiniMax-H3-Image Community License，对部署地区与商用有限制，请自行确认。
 
@@ -305,11 +323,15 @@ print('完成:', dst)
 ''')
 
 code(r'''
-import os, sys, re, time, socket, subprocess, urllib.request, json
+import os, sys, re, time, socket, subprocess, urllib.request, json, base64
 
 COMFY, PORT = '/content/ComfyUI', 8188
 LOG, TLOG, CF = '/content/comfyui.log', '/content/cloudflared.log', '/usr/local/bin/cloudflared'
-USE_NAMED_TUNNEL = False    # 想用固定域名 comfy.gmhqyj.ccwu.cc 时改 True，见下方说明
+
+# ---- 公网隧道自动二选一：有 Secret 用私有域名，没有走 trycloudflare ----
+PRIVATE_HOST = 'https://comfy.gmhqyj.ccwu.cc'   # Public Hostname -> localhost:8188
+SECRET_CANDIDATES = ['CF_TUNNEL_TOKEN_MINIMAX', 'CF_TUNNEL_TOKEN']  # 独立 Secret 优先
+ALLOW_SHARED_TOKEN = True   # False：检测到共享的 CF_TUNNEL_TOKEN 时不抢 Qwen 会话，直接走临时域名
 
 import torch as _t6
 if _t6.version.cuda is None or not _t6.cuda.is_available():
@@ -362,42 +384,93 @@ try:
 except Exception as e:
     print('object_info 读取失败:', repr(e))
 
-# ---------------- 公网隧道 ----------------
-if USE_NAMED_TUNNEL:
-    # 从 Colab Secret 读取；注意：同一个 Named Tunnel 只能有一个 Colab 会话连接。
-    # 若 Qwen-Image 会话还连着同一 token，两端会抢连接导致 502 / 1033。
+# ---------------- 公网隧道：有 Secret 用私有域名，没有走 trycloudflare ----------------
+TOKEN, SECRET_USED = None, None
+try:
     from google.colab import userdata
-    TOKEN = userdata.get('CF_TUNNEL_TOKEN')
-    subprocess.run("ps -eo pid,args | grep '[c]loudflared tunnel.*run --token' | awk '{print $1}' | xargs -r kill", shell=True)
+    for _name in SECRET_CANDIDATES:
+        try:
+            _val = userdata.get(_name)
+        except Exception:
+            _val = None
+        if _val:
+            TOKEN, SECRET_USED = _val, _name
+            break
+except Exception as e:
+    print('读取 Colab Secret 失败（%s）→ 走 quick tunnel' % type(e).__name__)
+
+if TOKEN and SECRET_USED == 'CF_TUNNEL_TOKEN' and not ALLOW_SHARED_TOKEN:
+    print('检测到共享 Secret CF_TUNNEL_TOKEN，ALLOW_SHARED_TOKEN=False → 不抢 Qwen 会话，走 quick tunnel')
+    TOKEN = None
+if not TOKEN:
+    print('未配置可用的隧道 Secret %s → 走 quick tunnel' % SECRET_CANDIDATES)
+else:
+    try:
+        meta = json.loads(base64.b64decode(TOKEN))
+        assert meta.get('a') and meta.get('t') and meta.get('s'), 'token 缺字段'
+        print('检测到 Secret %s | Tunnel ID: %s' % (SECRET_USED, meta['t']))
+    except Exception as e:
+        print('Secret 不是有效的隧道 token（%r）→ 走 quick tunnel' % e)
+        TOKEN = None
+
+def stop_named():
+    subprocess.run("ps -eo pid,args | grep '[c]loudflared tunnel.*run --token' "
+                   "| awk '{print $1}' | xargs -r kill", shell=True)
+
+def private_tunnel():
+    """有 Secret：接管 Named Tunnel，并验证固定域名真的可用"""
+    stop_named()   # 同一 token 只能一个 Colab 会话连接，先清掉旧连接
     time.sleep(1)
     nlog = open('/content/cloudflared_named.log', 'w')
-    subprocess.Popen([CF, 'tunnel', '--no-autoupdate', 'run', '--token', TOKEN],
-                     stdout=nlog, stderr=subprocess.STDOUT, start_new_session=True)
-    TUNNEL_URL = 'https://comfy.gmhqyj.ccwu.cc'
-    print('>>> 固定域名:', TUNNEL_URL, '(Public Hostname -> localhost:8188)')
-    print('    等待云端 ingress 下发 ...')
-    time.sleep(20)
-    selfcheck(TUNNEL_URL)
-else:
-    # 精确清理指向 8188 的旧隧道：绝不能复用 Qwen 笔记本 8010 那条的域名
+    p = subprocess.Popen([CF, 'tunnel', '--no-autoupdate', 'run', '--token', TOKEN],
+                         stdout=nlog, stderr=subprocess.STDOUT, start_new_session=True)
+    print('Named Tunnel PID:', p.pid, '| 等待云端下发 ingress / DNS ...')
+    for attempt in range(8):
+        time.sleep(5)
+        try:
+            with urllib.request.urlopen(PRIVATE_HOST + '/system_stats', timeout=20) as r:
+                body = r.read()
+            if b'comfyui_version' in body or b'devices' in body:
+                print('✅ 私有域名验证通过:', PRIVATE_HOST + '/system_stats')
+                return True
+        except Exception as e:
+            if attempt == 7:
+                print('私有域名验证失败: %r' % e)
+    print('⚠️ 检查 Zero Trust Public Hostname -> localhost:%d 与本地 ComfyUI；回退 quick tunnel' % PORT)
+    return False
+
+def quick_tunnel():
+    """无 Secret 或固定域名不可用：开 quick tunnel，拿 trycloudflare.com 临时域名"""
+    # 精确清理指向 8188 的旧隧道：绝不复用 Qwen 笔记本 8010 那条的域名
     subprocess.run("ps -eo pid,args | grep '[c]loudflared.*--url http://localhost:%d' "
-                   "| awk '{print $1}' | xargs -r kill" % PORT,
-                   shell=True)
+                   "| awk '{print $1}' | xargs -r kill" % PORT, shell=True)
     time.sleep(1)
     tlog = open(TLOG, 'w')
     subprocess.Popen([CF, 'tunnel', '--no-autoupdate', '--url', 'http://localhost:%d' % PORT],
                      stdout=tlog, stderr=subprocess.STDOUT, start_new_session=True)
-    TUNNEL_URL = None
     for _ in range(40):
         time.sleep(2)
         m = re.findall(r'https://[a-zA-Z0-9-]+\.trycloudflare\.com',
                        open(TLOG, errors='replace').read())
         if m:
-            TUNNEL_URL = m[0]; break
-    print('>>> ComfyUI 公网地址:', TUNNEL_URL or '未取到域名，看 /content/cloudflared.log')
-    print('    （重跑本 Cell 会更换临时域名；要固定域名请设 USE_NAMED_TUNNEL=True）')
-    if TUNNEL_URL:
-        selfcheck(TUNNEL_URL)
+            return m[0]
+    print('未取到临时域名，日志末尾:', open(TLOG, errors='replace').read()[-800:])
+    return None
+
+PRIVATE_OK = bool(TOKEN) and private_tunnel()
+if PRIVATE_OK:
+    TUNNEL_URL = PRIVATE_HOST
+    print('>>> 私有域名模式（Secret %s 已启用）' % SECRET_USED)
+    print('    ComfyUI Web UI: %s  |  原生 API: %s/system_stats' % (PRIVATE_HOST, PRIVATE_HOST))
+else:
+    if TOKEN:
+        stop_named()   # 私有域名验证失败，停掉 named 再走临时域名
+    TUNNEL_URL = quick_tunnel()
+    print('>>> quick tunnel 模式（临时域名，每次重启会变）')
+
+print('>>> ComfyUI 公网地址:', TUNNEL_URL or '未取到，等 30-60 秒重跑本 Cell')
+if TUNNEL_URL:
+    selfcheck(TUNNEL_URL)
 ''')
 
 code(r'''
@@ -463,10 +536,13 @@ md(r'''
 1. **先选 T4 GPU**（Runtime → Change runtime type → T4 GPU），再按顺序运行全部单元格。
 2. 依赖与权重全部走**官方源**：`pypi.org/simple`、`huggingface.co`。Colab 机器在境外，
    清华源 / hf-mirror 常未同步 2026 新包（`comfy-kitchen`、`comfy-aimdo`）与新仓库，不要用。
-3. 第 6 个单元格输出的 `trycloudflare.com` 地址就是 ComfyUI Web UI；该域名每次重启 Colab 都会变。
-   想用固定域名 `comfy.gmhqyj.ccwu.cc`，把该格的 `USE_NAMED_TUNNEL` 改成 `True`
-   （需 Colab Secret `CF_TUNNEL_TOKEN` 已开启本笔记本访问权限），但**同一个 Named Tunnel 不能
-   同时被两个 Colab 会话连接**，若 Qwen-Image 笔记本还在跑，请先用临时域名。
+3. 第 6 个单元格**自动二选一**：Colab Secret `CF_TUNNEL_TOKEN_MINIMAX` 或 `CF_TUNNEL_TOKEN`
+   存在、已授权、token 有效且 `comfy.gmhqyj.ccwu.cc/system_stats` 验证通过 → 打印固定域名；
+   否则打印 `trycloudflare.com` 临时域名（每次重启会变）。不需要再手动改 `USE_NAMED_TUNNEL`。
+   Secret 是**按笔记本授权**的，用 GitHub 链接打开新笔记本要在左侧 Secrets 面板重新开启访问权限。
+   ⚠️ **同一个 Named Tunnel token 只能一个 Colab 会话连接**：若 Qwen 笔记本也在用同一个
+   `CF_TUNNEL_TOKEN`，后跑的会接管固定域名、前一个会话公网会断。两个会话并存时给 MiniMax
+   单独建隧道 + 独立 Secret 名，或把 `ALLOW_SHARED_TOKEN` 设为 `False`。
 4. **工作流**：ComfyUI v0.45.0+ 自带 MiniMax H3-Image 模板，不要去找
    `vyrekai/minimax-h3-image-comfyui-workflows`（该仓库 GitHub 返回 404）。
    模型是 6 步采样、无 CFG、不支持 negative prompt；提示词建议用详细的英文整段描述。
@@ -486,8 +562,9 @@ md(r'''
     先 `Runtime → Change runtime type → T4 GPU` 并重连 VM；若已有 GPU 仍报错，运行仓库里的
     `notebooks/fix_cuda_torch_cell.py`。v2 已在环境检查、依赖安装、启动 ComfyUI 三处加 CUDA 硬门禁，
     不会再白跑 20 GB 下载。
-12. **隧道域名串到 8010**：v2 只按 `--url http://localhost:8188` 精确匹配清理/新建 quick tunnel；
-    `USE_NAMED_TUNNEL=True` 时也会设置 `TUNNEL_URL` 并自检固定域名，下一格健康检查可直接用公网地址。
+12. **隧道域名串到 8010**：只按 `--url http://localhost:8188` 精确匹配清理/新建 quick tunnel；
+    无论走私有域名还是临时域名，本格都会设置 `TUNNEL_URL` 并做 `/`、`/system_stats` 三次重试自检，
+    下一格健康检查可直接用公网地址。
 ''')
 
 for path in OUT:
