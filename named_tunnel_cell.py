@@ -11,9 +11,13 @@ except Exception as e:
         '读取 Colab Secret「CF_TUNNEL_TOKEN」失败：请确认密钥已添加，且已开启本笔记本的访问权限'
     ) from e
 
-BACKEND_PORT = 8010        # 8010=OpenAI 兼容代理；8188=ComfyUI 原生 API
+BACKEND_PORT = 8010        # 仅作打印提示；remotely-managed 隧道的 ingress 在 Dashboard 配置
 KEEP_QUICK_TUNNEL = True   # 保留旧 trycloudflare.com 域名做回退，改 False 则停掉
-PUBLIC_HOST = ''           # 已知域名可直接填，如 'qwen.example.com'
+PUBLIC_HOST = ''           # 日志没抓到域名时可手动填
+KNOWN_HOSTS = [
+    'qwythos.gmhqyj.ccwu.cc',   # -> localhost:8010  OpenAI 兼容接口
+    'comfy.gmhqyj.ccwu.cc',     # -> localhost:8188  ComfyUI Web UI / 原生 API
+]
 
 meta = json.loads(base64.b64decode(TOKEN))
 TID = meta['t']
@@ -64,20 +68,23 @@ print('隧道连接:', 'OK' if connected else '未确认（看下方日志）')
 
 hosts = sorted(set(re.findall(r'hostname\W{1,8}([a-zA-Z0-9][a-zA-Z0-9.-]*\.[a-zA-Z]{2,})', txt)))
 hosts = [h for h in hosts if not h.endswith('.cfargotunnel.com') and 'trycloudflare.com' not in h]
-if PUBLIC_HOST and PUBLIC_HOST not in hosts:
-    hosts.append(PUBLIC_HOST)
+for h in [PUBLIC_HOST] + KNOWN_HOSTS:
+    if h and h not in hosts:
+        hosts.append(h)
 print('云端 Public Hostname:', hosts or '（未发现 → 需去 Dashboard 配 Public Hostname）')
 
 safe = [l for l in txt.splitlines() if TOKEN not in l and 'eyJhIjoi' not in l]
 print('\n--- cloudflared 日志末尾 20 行（已过滤 token）---')
 print('\n'.join(safe[-20:]))
 
-for h in hosts[:3]:
+for h in hosts[:5]:
+    path = '/system_stats' if h.startswith('comfy.') else '/health'
     try:
-        with urllib.request.urlopen('https://' + h + '/health', timeout=15) as r:
-            print('验证 https://%s/health -> %s %s' % (h, r.status, r.read().decode()[:120]))
+        with urllib.request.urlopen('https://' + h + path, timeout=20) as r:
+            print('验证 https://%s%s -> %s %s' % (h, path, r.status, r.read().decode()[:120]))
     except Exception as e:
-        print('验证 https://%s/health 失败: %r' % (h, e))
+        print('验证 https://%s%s 失败: %r' % (h, path, e))
 
 print('\nDashboard: Zero Trust -> Networks -> Tunnels -> %s -> Public Hostname' % TID)
-print('  Service = HTTP, URL = localhost:%d' % BACKEND_PORT)
+print('  qwythos.gmhqyj.ccwu.cc   Service = HTTP, URL = localhost:8010')
+print('  comfy.gmhqyj.ccwu.cc     Service = HTTP, URL = localhost:8188')
