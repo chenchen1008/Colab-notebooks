@@ -67,6 +67,12 @@ code(
     "    print('torch 未安装:', e)",
     "!nvidia-smi",
     "!df -h /content | tail -1",
+    "# 硬门禁：CPU 运行时不要继续往下跑，ComfyUI 会在 comfy/model_management.py 崩",
+    "import torch as _t",
+    "if _t.version.cuda is None or not _t.cuda.is_available():",
+    "    raise RuntimeError('当前 torch=%s 无 CUDA 支持（CPU 运行时，或 torch 被 pip 换成 CPU 版）。"
+    "先 Runtime → Change runtime type 选 T4 GPU 并重新连接；若已选 GPU 仍报错，运行 fix_cuda_torch_cell.py' % _t.__version__)",
+    "print('✅ CUDA 检查通过:', _t.__version__, '|', _t.cuda.get_device_name(0))",
 )
 
 # ---------------- Cell 3: 官方源探测与真实大小校验 ----------------
@@ -123,7 +129,15 @@ code(
     "PYPI = 'https://pypi.org/simple'",
     "# 全量安装官方 requirements：含 comfy-aimdo==0.6.0 与 comfy-kitchen==0.2.41",
     "# 这两个是 2026 新包，缺了会让 comfy/quant_ops.py 的 ck 未定义，ComfyUI 直接崩",
-    "!pip install -q -r requirements.txt -i $PYPI",
+    "# 但 requirements 里的 torch / torchvision / torchsde 必须剔除：",
+    "# Colab GPU 运行时自带 torch+cu130，从 PyPI 重装可能换成不带 CUDA 的 wheel，",
+    "# 触发 AssertionError: Torch not compiled with CUDA enabled",
+    "_src = open('requirements.txt', encoding='utf-8').read().splitlines()",
+    "_keep = [l for l in _src if l.strip().lower().split('==')[0].split('>=')[0].split('<')[0]"
+    " not in ('torch', 'torchvision', 'torchaudio', 'torchsde')]",
+    "open('/content/requirements_notorch.txt', 'w', encoding='utf-8').write('\\n'.join(_keep))",
+    "print('已过滤 torch 家族 %d 行，保留 %d 行依赖' % (len(_src) - len(_keep), len(_keep)))",
+    "!pip install -q -r /content/requirements_notorch.txt -i $PYPI",
     "!pip install -q fastapi uvicorn requests -i $PYPI",
     "# 精确兜底：INT8 ConvRot 文本编码器依赖 comfy-kitchen 的量化 layout",
     "!pip install -q 'comfy-kitchen==0.2.41' 'comfy-aimdo==0.6.0' -i $PYPI",
@@ -135,6 +149,12 @@ code(
     "    'import comfy_kitchen, comfy_aimdo; from comfy.quant_ops import ck; print(\"依赖 OK\")'],",
     "    capture_output=True, text=True)",
     "print('依赖校验:', (chk.stdout or chk.stderr).strip()[-400:])",
+    "# 子进程实测 torch（当前 kernel 可能缓存了旧模块，子进程才反映磁盘上的真实版本）",
+    "chk_t = subprocess.run([sys.executable, '-c',",
+    "    'import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())'],",
+    "    capture_output=True, text=True)",
+    "print('torch 实测:', (chk_t.stdout or chk_t.stderr).strip())",
+    "assert 'True' in chk_t.stdout, 'torch 无 CUDA：切 T4 GPU 或运行 fix_cuda_torch_cell.py'",
     "print('ComfyUI 就绪')",
 )
 
@@ -170,6 +190,9 @@ code(
 # ---------------- Cell 6: 启动 ComfyUI (8188) ----------------
 code(
     "import subprocess, sys, time, socket, os",
+    "import torch as _t6",
+    "if _t6.version.cuda is None or not _t6.cuda.is_available():",
+    "    raise RuntimeError('torch 无 CUDA：先切 T4 GPU / 运行 fix_cuda_torch_cell.py，否则 ComfyUI 必崩')",
     "",
     "def port_open(p, host='127.0.0.1'):",
     "    s = socket.socket(); s.settimeout(1)",
