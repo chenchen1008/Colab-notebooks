@@ -1,0 +1,552 @@
+#!/usr/bin/env python3
+"""生成 Qwen-Image-2.1-Turbo Colab 笔记本 (Qwen-Image-2.1-Turbo-Colab.ipynb)"""
+import json
+
+nb = {
+    "cells": [],
+    "metadata": {
+        "kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
+        "language_info": {"name": "python", "version": "3.10"},
+    },
+    "nbformat": 4,
+    "nbformat_minor": 5,
+}
+
+def md(*lines):
+    nb["cells"].append({"cell_type": "markdown", "metadata": {}, "source": [l + "\n" for l in lines]})
+
+def code(*lines):
+    nb["cells"].append({"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [], "source": [l + "\n" for l in lines]})
+
+def code_raw(src):
+    """整段原始字符串 -> 逐行 code Cell（长 Cell 更好维护）"""
+    code(*src.strip("\n").split("\n"))
+
+# ---------------- Cell 1: 说明与选型 ----------------
+md(
+    "# Qwen-Image-2.1-Turbo 在 Google Colab 上运行",
+    "",
+    "基于 [abenzerps/Qwen-Image-2.1-Turbo-Quantized](https://huggingface.co/abenzerps/Qwen-Image-2.1-Turbo-Quantized)，",
+    "在 Colab 免费 T4 (16GB VRAM) 上部署，并提供 **OpenAI 风格 `/v1/images/generations` 接口**（端口 `8010`），",
+    "再用 `cloudflared` 暴露公网地址（固定域名见文末可选单元格）。",
+    "",
+    "## 模型选型（Colab 推荐）",
+    "",
+    "| 量化文件 | 大小 | 建议 |",
+    "|---|---|---|",
+    "| `qwen-image-2.1-turbo-Q4_K_M.gguf` | 4.05 GB | ✅ Colab 首选，体积与质量平衡 |",
+    "| `qwen-image-2.1-turbo-Q4_0.gguf` | 4.05 GB | 显存极紧时的备选 |",
+    "| `qwen-image-2.1-turbo-Q5_K_M.gguf` | 4.94 GB | 质量更好，稍慢，T4 16GB 可跑 |",
+    "| `qwen-image-2.1-turbo-Q6_K.gguf` | 5.88 GB | 显存吃紧，慎选 |",
+    "| `qwen-image-2.1-turbo-Q8_0.gguf` | 7.59 GB | 一般不建议在免费 Colab 上使用 |",
+    "",
+    "必须配套下载（工作流三件套）：",
+    "- 文本编码器：`text_encoders/qwen3vl_8b_int8_convrot.safetensors` (9.35 GB，INT8 更省显存)",
+    "- VAE：`vae/qwen_image_2.1_vae_bf16.safetensors` (0.68 GB)",
+    "",
+    "合计约 **14 GB** 下载；Colab 免费版磁盘通常充足，下载需 10–30 分钟，视网络而定。",
+    "",
+    "> **注意**：这是文生图（DiT 7B）模型，**不适用 `llama-cpp-python`**（那是文本模型推理库）。",
+    "本笔记本采用 ComfyUI + [ComfyUI-GGUF](https://github.com/leejet/ComfyUI-GGUF) 运行 GGUF 权重。",
+    "",
+    "**关于 FastAPI 这层**：ComfyUI 自带完整 HTTP API（`/prompt`、`/history`、`/view`），本身就能出图，",
+    "FastAPI **不是必需的**，它只是把 ComfyUI 的工作流 JSON 包装成 OpenAI 兼容的",
+    "`/v1/images/generations` + `b64_json`，方便沿用 OpenAI 客户端。",
+    "若不想要这层，把隧道 Cell 里的 `TUNNEL_PORT` 改成 `8188`，直接访问 ComfyUI 原生 API 即可。",
+    "",
+    "运行前：`Runtime → Change runtime type → T4 GPU`，保存后重新运行全部 Cell。",
+)
+
+# ---------------- Cell 2: 环境检查 ----------------
+code(
+    "import sys, os",
+    "print('Python:', sys.version)",
+    "try:",
+    "    import torch",
+    "    print('torch:', torch.__version__, '| cuda:', torch.cuda.is_available())",
+    "    if torch.cuda.is_available():",
+    "        print('GPU:', torch.cuda.get_device_name(0))",
+    "        print('VRAM: %.1f GB' % (torch.cuda.get_device_properties(0).total_memory / 1e9))",
+    "except Exception as e:",
+    "    print('torch 未安装:', e)",
+    "!nvidia-smi",
+    "!df -h /content | tail -1",
+    "# 硬门禁：CPU 运行时不要继续往下跑，ComfyUI 会在 comfy/model_management.py 崩",
+    "import torch as _t",
+    "if _t.version.cuda is None or not _t.cuda.is_available():",
+    "    raise RuntimeError('当前 torch=%s 无 CUDA 支持（CPU 运行时，或 torch 被 pip 换成 CPU 版）。"
+    "先 Runtime → Change runtime type 选 T4 GPU 并重新连接；若已选 GPU 仍报错，运行 fix_cuda_torch_cell.py' % _t.__version__)",
+    "print('✅ CUDA 检查通过:', _t.__version__, '|', _t.cuda.get_device_name(0))",
+)
+
+# ---------------- Cell 3: 官方源探测与真实大小校验 ----------------
+code(
+    "import urllib.request, time",
+    "# Colab 机器在境外：直连官方 huggingface.co / pypi.org 最全最快。",
+    "# 国内镜像常未同步 2026 年的新包/新仓库，不要用。",
+    "REPO_PATH = '/abenzerps/Qwen-Image-2.1-Turbo-Quantized/resolve/main'",
+    "REMOTES = [",
+    "    'qwen-image-2.1-turbo-Q4_K_M.gguf',",
+    "    'text_encoders/qwen3vl_8b_int8_convrot.safetensors',",
+    "    'vae/qwen_image_2.1_vae_bf16.safetensors',",
+    "]",
+    "CANDIDATES = [",
+    '    ("huggingface.co 官方", "https://huggingface.co"),',
+    '    ("hf-mirror.com 备用", "https://hf-mirror.com"),',
+    "]",
+    "",
+    "def head(base, path):",
+    '    req = urllib.request.Request(base + REPO_PATH + "/" + path, method="HEAD")',
+    "    t0 = time.time()",
+    "    try:",
+    "        with urllib.request.urlopen(req, timeout=20) as r:",
+    "            return round(time.time() - t0, 2), int(r.headers.get('Content-Length', 0)), r.status",
+    "    except Exception as e:",
+    "        return None, 0, repr(e)[:80]",
+    "",
+    "# 用最小的 VAE 探测延迟，避免大文件 HEAD 拖慢",
+    "rows = []",
+    "for name, base in CANDIDATES:",
+    "    dt, size, status = head(base, REMOTES[2])",
+    "    rows.append((name, base, dt, size, status))",
+    "    print(f'{name:24s} {str(dt):>6}s  status={status}  probe={size/1e6:.1f} MB')",
+    "",
+    "ok = [r for r in rows if r[2] is not None and r[3] > 0]",
+    'BASE = min(ok, key=lambda r: r[2])[1] if ok else "https://huggingface.co"',
+    'print(">>> 选用源:", BASE)',
+    "",
+    "# 关键：远端路径带子目录，拿真实大小作为下载校验基准",
+    "EXPECT = {}",
+    "for p in REMOTES:",
+    "    _, sz, _ = head(BASE, p)",
+    "    EXPECT[p] = sz",
+    "    print(f'  远端 {p}: {sz/1e9:.2f} GB' if sz else f'  ⚠️ 取不到大小: {p}')",
+)
+
+# ---------------- Cell 4: 安装 ComfyUI + ComfyUI-GGUF（官方 PyPI） ----------------
+code(
+    "import os, subprocess, sys",
+    "os.chdir('/content')",
+    "if not os.path.exists('/content/ComfyUI'):",
+    "    !git clone https://github.com/comfyanonymous/ComfyUI.git",
+    "os.chdir('/content/ComfyUI')",
+    "PYPI = 'https://pypi.org/simple'",
+    "# 全量安装官方 requirements：含 comfy-aimdo==0.6.0 与 comfy-kitchen==0.2.41",
+    "# 这两个是 2026 新包，缺了会让 comfy/quant_ops.py 的 ck 未定义，ComfyUI 直接崩",
+    "# 但 requirements 里的 torch / torchvision / torchsde 必须剔除：",
+    "# Colab GPU 运行时自带 torch+cu130，从 PyPI 重装可能换成不带 CUDA 的 wheel，",
+    "# 触发 AssertionError: Torch not compiled with CUDA enabled",
+    "_src = open('requirements.txt', encoding='utf-8').read().splitlines()",
+    "_keep = [l for l in _src if l.strip().lower().split('==')[0].split('>=')[0].split('<')[0]"
+    " not in ('torch', 'torchvision', 'torchaudio', 'torchsde')]",
+    "open('/content/requirements_notorch.txt', 'w', encoding='utf-8').write('\\n'.join(_keep))",
+    "print('已过滤 torch 家族 %d 行，保留 %d 行依赖' % (len(_src) - len(_keep), len(_keep)))",
+    "!pip install -q -r /content/requirements_notorch.txt -i $PYPI",
+    "!pip install -q fastapi uvicorn requests -i $PYPI",
+    "# 精确兜底：INT8 ConvRot 文本编码器依赖 comfy-kitchen 的量化 layout",
+    "!pip install -q 'comfy-kitchen==0.2.41' 'comfy-aimdo==0.6.0' -i $PYPI",
+    "if not os.path.exists('/content/ComfyUI/custom_nodes/ComfyUI-GGUF'):",
+    "    !git clone https://github.com/leejet/ComfyUI-GGUF.git custom_nodes/ComfyUI-GGUF",
+    "!pip install -q -r custom_nodes/ComfyUI-GGUF/requirements.txt -i $PYPI",
+    "# 装完立刻校验，避免静默漏装",
+    "chk = subprocess.run([sys.executable, '-c',",
+    "    'import comfy_kitchen, comfy_aimdo; from comfy.quant_ops import ck; print(\"依赖 OK\")'],",
+    "    capture_output=True, text=True)",
+    "print('依赖校验:', (chk.stdout or chk.stderr).strip()[-400:])",
+    "# 子进程实测 torch（当前 kernel 可能缓存了旧模块，子进程才反映磁盘上的真实版本）",
+    "chk_t = subprocess.run([sys.executable, '-c',",
+    "    'import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())'],",
+    "    capture_output=True, text=True)",
+    "print('torch 实测:', (chk_t.stdout or chk_t.stderr).strip())",
+    "assert 'True' in chk_t.stdout, 'torch 无 CUDA：切 T4 GPU 或运行 fix_cuda_torch_cell.py'",
+    "print('ComfyUI 就绪')",
+)
+
+# ---------------- Cell 5: 下载模型三件套（远端路径带子目录） ----------------
+code(
+    "import os, time",
+    "MODEL_DIR = '/content/ComfyUI/models'",
+    "# 左：本地路径；右：HF 仓库内路径（text_encoders/ 与 vae/ 是仓库里的子目录，不能省）",
+    "FILES = [",
+    "    ('diffusion_models/qwen-image-2.1-turbo-Q4_K_M.gguf', 'qwen-image-2.1-turbo-Q4_K_M.gguf'),",
+    "    ('text_encoders/qwen3vl_8b_int8_convrot.safetensors', 'text_encoders/qwen3vl_8b_int8_convrot.safetensors'),",
+    "    ('vae/qwen_image_2.1_vae_bf16.safetensors', 'vae/qwen_image_2.1_vae_bf16.safetensors'),",
+    "]",
+    "for rel, remote in FILES:",
+    "    dst = os.path.join(MODEL_DIR, rel)",
+    "    os.makedirs(os.path.dirname(dst), exist_ok=True)",
+    "    expect = EXPECT.get(remote, 0)",
+    "    if os.path.exists(dst) and (expect == 0 or os.path.getsize(dst) == expect):",
+    "        print('✅ 已完整，跳过:', rel, '%.2f GB' % (os.path.getsize(dst)/1e9))",
+    "        continue",
+    "    if os.path.exists(dst) and os.path.getsize(dst) < 1e6:",
+    "        os.remove(dst)   # 清掉 404 留下的 0 字节残留",
+    "    url = BASE + '/abenzerps/Qwen-Image-2.1-Turbo-Quantized/resolve/main/' + remote",
+    "    print('下载:', remote)",
+    "    t0 = time.time()",
+    "    !wget -c -q --show-progress \"$url\" -O \"$dst\"",
+    "    dt = max(time.time() - t0, 1e-6)",
+    "    got = os.path.getsize(dst) if os.path.exists(dst) else 0",
+    "    ok = (expect == 0 or abs(got - expect) < expect * 0.01) and got > 1e6",
+    "    print(('✅' if ok else '❌'), rel, '%.2f GB' % (got/1e9), '| %.1f MB/s' % (got/1e6/dt))",
+)
+
+# ---------------- Cell 6: 启动 ComfyUI (8188) ----------------
+code(
+    "import subprocess, sys, time, socket, os",
+    "import torch as _t6",
+    "if _t6.version.cuda is None or not _t6.cuda.is_available():",
+    "    raise RuntimeError('torch 无 CUDA：先切 T4 GPU / 运行 fix_cuda_torch_cell.py，否则 ComfyUI 必崩')",
+    "",
+    "def port_open(p, host='127.0.0.1'):",
+    "    s = socket.socket(); s.settimeout(1)",
+    "    try:",
+    "        s.connect((host, p)); return True",
+    "    except Exception:",
+    "        return False",
+    "    finally:",
+    "        s.close()",
+    "",
+    "if port_open(8188):",
+    "    print('ComfyUI 已在运行: http://127.0.0.1:8188')",
+    "else:",
+    "    # 用 w 覆盖，避免旧 traceback 混进日志误导排查",
+    "    log = open('/content/comfyui.log', 'w')",
+    "    comfy = subprocess.Popen([sys.executable, 'main.py', '--listen', '0.0.0.0', '--port', '8188'],",
+    "                             cwd='/content/ComfyUI', stdout=log, stderr=log, start_new_session=True)",
+    "    print('ComfyUI PID:', comfy.pid)",
+    "    for _ in range(60):",
+    "        time.sleep(3)",
+    "        if port_open(8188):",
+    "            break",
+    "    if port_open(8188):",
+    "        print('✅ ComfyUI 已就绪: http://127.0.0.1:8188')",
+    "        try:",
+    "            import urllib.request, json",
+    "            info = json.load(urllib.request.urlopen('http://127.0.0.1:8188/object_info', timeout=30))",
+    "            print('  UnetLoaderGGUF 已注册:', 'UnetLoaderGGUF' in info)",
+    "        except Exception as e:",
+    "            print('  object_info 读取失败:', repr(e))",
+    "    else:",
+    "        print('❌ 启动失败，日志末尾 40 行:' )",
+    "        print('\\n'.join(open('/content/comfyui.log').read().splitlines()[-40:]))",
+)
+
+# ---------------- Cell 7: 写入 qwen_api.py（真正写文件，不在单元格内跑 uvicorn） ----------------
+# 代理源码统一放在 qwen_api.py，笔记本与修复脚本共用同一份，避免分叉
+API_SRC = open('/Users/apple/WorkBuddy/2026-11-15-20-29-14/qwen_api.py', encoding='utf-8').read().splitlines()
+code("%%writefile /content/qwen_api.py", *API_SRC)
+# ---------------- Cell 8: 启动 FastAPI 代理 ----------------
+code(
+    "import subprocess, sys, time, os",
+    "",
+    "if not os.path.exists('/content/qwen_api.py'):",
+    "    raise RuntimeError('缺少 /content/qwen_api.py —— 请先运行上一单元格（%%writefile）')",
+    "",
+    "# 清掉可能残留的死进程，避免端口占用",
+    "subprocess.run(\"ps -eo pid,args | grep '[q]wen_api.py' | awk '{print $1}' | xargs -r kill\", shell=True)",
+    "time.sleep(1)",
+    "api = subprocess.Popen([sys.executable, 'qwen_api.py'], cwd='/content',",
+    "                       stdout=open('/content/qwen_api.log', 'w'), stderr=subprocess.STDOUT,",
+    "                       start_new_session=True)",
+    "print('FastAPI 代理 PID:', api.pid)",
+    "for _ in range(40):",
+    "    if port_open(8010):",
+    "        break",
+    "    time.sleep(2)",
+    "if port_open(8010):",
+    "    print('✅ FastAPI 已就绪: http://127.0.0.1:8010/v1/images/generations')",
+    "else:",
+    "    print('❌ 8010 未监听，/content/qwen_api.log 末尾:' )",
+    "    print(open('/content/qwen_api.log').read()[-2000:])",
+)
+
+# ---------------- Cell 9: cloudflared 公网隧道（按 Secret 自动二选一） ----------------
+code_raw(r'''
+import subprocess, re, time, os, json, base64, urllib.request
+
+TUNNEL_PORT = 8010   # 改成 8188 即直连 ComfyUI 原生 API（不需要 FastAPI 这层）
+CF = '/usr/local/bin/cloudflared'
+API_HOST = 'https://qwythos.gmhqyj.ccwu.cc'      # Public Hostname -> localhost:8010
+COMFY_HOST = 'https://comfy.gmhqyj.ccwu.cc'      # Public Hostname -> localhost:8188
+PRIVATE_HOST = API_HOST if TUNNEL_PORT == 8010 else COMFY_HOST
+PROBE_PATH = '/health' if TUNNEL_PORT == 8010 else '/system_stats'
+
+if not os.path.exists(CF):
+    subprocess.run(['wget', '-q',
+        'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64',
+        '-O', CF], check=True)
+    subprocess.run(['chmod', '+x', CF], check=True)
+
+# ---- 1) 有 Secret 用私有域名，没有（或本笔记本未授权）走 trycloudflare ----
+TOKEN = None
+try:
+    from google.colab import userdata
+    TOKEN = userdata.get('CF_TUNNEL_TOKEN')
+except Exception as e:
+    print('未读取到 Secret CF_TUNNEL_TOKEN（%s）→ 走 quick tunnel' % type(e).__name__)
+if not TOKEN:
+    print('未配置 Secret CF_TUNNEL_TOKEN → 走 quick tunnel')
+else:
+    try:
+        meta = json.loads(base64.b64decode(TOKEN))
+        assert meta.get('a') and meta.get('t') and meta.get('s'), 'token 缺字段'
+        print('检测到 Secret CF_TUNNEL_TOKEN | Tunnel ID:', meta['t'])
+    except Exception as e:
+        print('Secret 不是有效的隧道 token（%r）→ 走 quick tunnel' % e)
+        TOKEN = None
+
+def quick_tunnel():
+    """无 Secret 或私有域名不可用：开 quick tunnel，拿 trycloudflare.com 临时域名"""
+    cmd = "ps -eo args | grep -c '[c]loudflared.*--url http://localhost:%d'" % TUNNEL_PORT
+    running = subprocess.run(cmd, shell=True, capture_output=True, text=True).stdout.strip()
+    log_path = '/content/cloudflared.log'
+    if running != '0' and os.path.exists(log_path):
+        m = re.findall(r'https://[a-zA-Z0-9-]+\.trycloudflare\.com',
+                       open(log_path, errors='replace').read())
+        if m:
+            print('已有指向 %d 的 quick tunnel，沿用原域名' % TUNNEL_PORT)
+            return m[0]
+    tlog = open(log_path, 'w')
+    subprocess.Popen([CF, 'tunnel', '--no-autoupdate', '--url',
+                      'http://localhost:%d' % TUNNEL_PORT],
+                     stdout=tlog, stderr=subprocess.STDOUT, start_new_session=True)
+    for _ in range(40):
+        time.sleep(2)
+        m = re.findall(r'https://[a-zA-Z0-9-]+\.trycloudflare\.com',
+                       open(log_path, errors='replace').read())
+        if m:
+            return m[0]
+    print('未取到临时域名，日志末尾：\n', open(log_path, errors='replace').read()[-800:])
+    return None
+
+def stop_named():
+    subprocess.run("ps -eo pid,args | grep '[c]loudflared tunnel.*run --token' "
+                   "| awk '{print $1}' | xargs -r kill", shell=True)
+
+def private_tunnel():
+    """有 Secret：接管 Named Tunnel，并验证固定域名是否真的可用"""
+    stop_named()
+    time.sleep(1)
+    log = open('/content/cloudflared_named.log', 'w')
+    p = subprocess.Popen([CF, 'tunnel', '--no-autoupdate', '--loglevel', 'info',
+                          'run', '--token', TOKEN],
+                         stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+    print('Named Tunnel PID:', p.pid, '| 等待云端下发 ingress ...')
+    for attempt in range(8):
+        time.sleep(5)
+        try:
+            with urllib.request.urlopen(PRIVATE_HOST + PROBE_PATH, timeout=20) as r:
+                body = r.read()
+            if TUNNEL_PORT == 8010 and json.loads(body).get('ok') is not True:
+                continue
+            print('✅ 私有域名验证通过:', PRIVATE_HOST + PROBE_PATH)
+            return True
+        except Exception as e:
+            if attempt == 7:
+                print('私有域名验证失败: %r' % e)
+    print('⚠️ 检查 Zero Trust → Public Hostname 与本地 %d 端口；先回退 quick tunnel' % TUNNEL_PORT)
+    return False
+
+PRIVATE_OK = bool(TOKEN) and private_tunnel()
+if PRIVATE_OK:
+    PUBLIC_BASE = PRIVATE_HOST
+    print('>>> 私有域名模式（Secret CF_TUNNEL_TOKEN 已启用）')
+    print('>>> 另一条固定域名:', COMFY_HOST if TUNNEL_PORT == 8010 else API_HOST)
+else:
+    if TOKEN:
+        stop_named()   # 私有域名验证失败，停掉 named 再走临时域名
+    PUBLIC_BASE = quick_tunnel()
+    print('>>> quick tunnel 模式（临时域名，每次重启会变）')
+
+if PUBLIC_BASE:
+    print('>>> 公网地址:', PUBLIC_BASE)
+    if TUNNEL_PORT == 8010:
+        print('>>> OpenAI 兼容接口:', PUBLIC_BASE + '/v1/images/generations')
+    else:
+        print('>>> ComfyUI 原生 API:', PUBLIC_BASE + '/system_stats')
+else:
+    print('❌ 没拿到公网地址，等 30-60 秒重跑本 Cell')
+''')
+
+# ---------------- Cell 10: 测试出图 ----------------
+code(
+    "import requests, base64, time",
+    "from IPython.display import Image, display",
+    "payload = {",
+    "    'prompt': '一只穿宇航服的猫坐在月球表面，背景是地球升起，电影级光照，超细节，4K',",
+    "    'width': 1024, 'height': 1024, 'steps': 8, 'seed': 42, 'cfg': 1.0",
+    "}",
+    "t0 = time.time()",
+    "r = requests.post('http://127.0.0.1:8010/v1/images/generations', json=payload, timeout=600)",
+    "dt = time.time() - t0",
+    "print('HTTP', r.status_code, '| 端到端耗时: %.1f 秒' % dt)",
+    "res = r.json()",
+    "if 'error' in res:",
+    "    print('❌', res.get('error'), '\\n', res.get('detail', '')[:1500])",
+    "else:",
+    "    img_b64 = res['data'][0]['b64_json']",
+    "    open('/content/qwen_image_test.png', 'wb').write(base64.b64decode(img_b64))",
+    "    display(Image(filename='/content/qwen_image_test.png'))",
+)
+
+# ---------------- Cell 11: 可选：固定私有域名 ----------------
+md(
+    "# 可选：手动接管固定域名 + 8188 ComfyUI 访问",
+    "",
+    "主流程的隧道 Cell 已**自动二选一**：Colab Secret 里有 `CF_TUNNEL_TOKEN` 且本笔记本已授权 →",
+    "自动启动 Named Tunnel，使用 `qwythos.gmhqyj.ccwu.cc` / `comfy.gmhqyj.ccwu.cc`；",
+    "没有 Secret（或本笔记本未授权、token 无效、固定域名验证失败）→ 自动开 quick tunnel，",
+    "使用 `trycloudflare.com` 临时域名。下面两个单元格只在需要**强制重启/接管**或本机打不开固定域名时用。",
+    "",
+    "| 域名 | 后端 | 用途 |",
+    "| --- | --- | --- |",
+    "| `qwythos.gmhqyj.ccwu.cc` | `localhost:8010` | OpenAI 兼容 `/v1/images/generations` |",
+    "| `comfy.gmhqyj.ccwu.cc` | `localhost:8188` | ComfyUI Web UI、`/prompt`、`/history`、`/view`、`/object_info` |",
+    "",
+    "**前提**：Colab 左侧 Secrets 已添加 `CF_TUNNEL_TOKEN` 并开启本笔记本访问权限；Cloudflare Zero Trust",
+    "→ Networks → Tunnels → 该隧道 → Public Hostname 已按上表配好两条。",
+    "",
+    "⚠️ 两个域名目前都没有鉴权，8188 的 `/view` 能读输出文件，建议加 Cloudflare Access。",
+    "若本机浏览器打不开 `*.gmhqyj.ccwu.cc`（部分网络会在 TLS 握手阶段阻断），用第三个单元格给出的",
+    "`trycloudflare.com` 临时域名，或换网络 / 调整代理规则。",
+)
+
+# ---------------- Cell 12: 启动 Named Tunnel 并验证两个固定域名 ----------------
+code(
+    "# 强制接管/重启固定域名（主流程 Cell 已自动判断，一般不用再跑；token 从 Secret 读取，无明文）",
+    "import os, subprocess, time, urllib.request",
+    "from google.colab import userdata",
+    "",
+    "try:",
+    "    TOKEN = userdata.get('CF_TUNNEL_TOKEN')",
+    "except Exception as e:",
+    "    raise RuntimeError('请先在 Colab 左侧 Secrets 添加 CF_TUNNEL_TOKEN，并开启本笔记本访问权限') from e",
+    "",
+    "CF = '/usr/local/bin/cloudflared'",
+    "if not os.path.exists(CF):",
+    "    subprocess.run(['wget', '-q',",
+    "        'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64',",
+    "        '-O', CF], check=True)",
+    "    subprocess.run(['chmod', '+x', CF], check=True)",
+    "",
+    "# 只清理同 token 的旧连接，保留 quick tunnel 做回退",
+    "subprocess.run(\"ps -eo pid,args | grep '[c]loudflared tunnel.*run --token' | awk '{print $1}' | xargs -r kill\", shell=True)",
+    "time.sleep(1)",
+    "LOG = '/content/cloudflared_named.log'",
+    "log = open(LOG, 'w')",
+    "p = subprocess.Popen([CF, 'tunnel', '--no-autoupdate', '--loglevel', 'info', 'run', '--token', TOKEN],",
+    "                     stdout=log, stderr=subprocess.STDOUT, start_new_session=True)",
+    "print('Named Tunnel PID:', p.pid, '| 等待云端下发 ingress ...')",
+    "time.sleep(12)",
+    "",
+    "API = 'https://qwythos.gmhqyj.ccwu.cc'",
+    "COMFY = 'https://comfy.gmhqyj.ccwu.cc'",
+    "for label, url in [('8010 /health', API + '/health'), ('8010 /v1/models', API + '/v1/models'),",
+    "                   ('8188 /system_stats', COMFY + '/system_stats'), ('8188 Web UI', COMFY + '/')]:",
+    "    for attempt in range(3):",
+    "        try:",
+    "            with urllib.request.urlopen(url, timeout=30) as r:",
+    "                body = r.read()",
+    "                print('%-20s HTTP %s | %d bytes' % (label, r.status, len(body)))",
+    "            break",
+    "        except Exception as e:",
+    "            if attempt == 2:",
+    "                print('%-20s 失败: %r（DNS 未生效就等 30 秒重跑本 Cell）' % (label, e))",
+    "            else:",
+    "                time.sleep(8)",
+    "print('固定域名:', API, '|', COMFY)",
+)
+
+# ---------------- Cell 13: 8188 独立 quick tunnel ----------------
+code(
+    "# 可选：给 8188 单独开一条 quick tunnel（本机打不开私有域名时用这个临时地址）",
+    "import subprocess, re, time, os, socket, urllib.request",
+    "PORT, CF, LOG = 8188, '/usr/local/bin/cloudflared', '/content/cloudflared_8188.log'",
+    "",
+    "def alive(p):",
+    "    s = socket.socket(); s.settimeout(1)",
+    "    try:",
+    "        s.connect(('127.0.0.1', p)); return True",
+    "    except Exception:",
+    "        return False",
+    "    finally:",
+    "        s.close()",
+    "",
+    "assert alive(PORT), '8188 未监听：先重跑「启动 ComfyUI」Cell'",
+    "subprocess.run(\"ps -eo pid,args | grep '[c]loudflared.*--url http://localhost:8188' | awk '{print $1}' | xargs -r kill\", shell=True)",
+    "time.sleep(1)",
+    "log = open(LOG, 'w')",
+    "subprocess.Popen([CF, 'tunnel', '--no-autoupdate', '--url', 'http://localhost:8188'],",
+    "                 stdout=log, stderr=subprocess.STDOUT, start_new_session=True)",
+    "",
+    "URL = None",
+    "for _ in range(40):",
+    "    time.sleep(2)",
+    "    m = re.findall(r'https://[a-zA-Z0-9-]+\\.trycloudflare\\.com', open(LOG, errors='replace').read())",
+    "    if m:",
+    "        URL = m[0]; break",
+    "print('>>> ComfyUI 临时公网地址:', URL or '未取到，见 /content/cloudflared_8188.log')",
+    "if URL:",
+    "    for path in ['/', '/system_stats']:",
+    "        for attempt in range(3):",
+    "            try:",
+    "                with urllib.request.urlopen(URL + path, timeout=45) as r:",
+    "                    print('  %-14s HTTP %s | %d bytes' % (path, r.status, len(r.read())))",
+    "                break",
+    "            except Exception as e:",
+    "                if attempt == 2:",
+    "                    print('  %-14s 失败: %r（新域名 DNS 未生效，等 30-60 秒重跑）' % (path, e))",
+    "                else:",
+    "                    time.sleep(10)",
+    "    print('Web UI:', URL)",
+    "    print('原生 API: %s/prompt  /history  /view  /object_info  wss://.../ws' % URL)",
+)
+
+# ---------------- Cell 14: 调用示例与 FAQ ----------------
+md(
+    "# 用你自己的 OpenAI 客户端调用",
+    "",
+    "```python",
+    "from openai import OpenAI",
+    "client = OpenAI(base_url='https://qwythos.gmhqyj.ccwu.cc/v1', api_key='not-needed')",
+    "resp = client.images.generate(",
+    "    model='qwen-image-2.1-turbo-Q4_K_M.gguf',",
+    "    prompt='春日樱花下的江南小镇，水墨风格，8K',",
+    "    width=1024, height=1024",
+    ")",
+    "img_b64 = resp.data[0].b64_json",
+    "```",
+    "",
+    "### FAQ",
+    "- **跑不起来？** 确认 Colab 运行时选了 **T4 GPU**；本地 CPU 推理 DiT 7B 太慢，不建议。",
+    "- **显存不足？** 把 `qwen3vl_8b_int8_convrot.safetensors` 换更小的量化，或把 `width/height` 降到 768。",
+    "- **下载慢？** Colab 机器在境外，pip 与模型都走官方源（`pypi.org` / `huggingface.co`）；",
+    "  国内镜像常未同步 2026 新包（如 `comfy-kitchen`），**不要**改用清华源或 hf-mirror。",
+    "- **ComfyUI 报 `cannot import name 'ck'`？** 缺 `comfy-kitchen==0.2.41`，用官方 PyPI 重装 `requirements.txt`。",
+    "- **模型文件 0 字节？** HF 仓库里 `text_encoders/` 和 `vae/` 是子目录，下载 URL 必须带上，否则 404。",
+    "- **公网域名 502？** 隧道活着但 8010 没监听。按顺序重跑「写入 qwen_api.py → 启动代理」两个 Cell；",
+    "  用 `curl http://127.0.0.1:8010/health` 确认后端，再刷新公网域名。隧道进程保留则域名不变。",
+    "- **不想要 FastAPI？** 把隧道 Cell 的 `TUNNEL_PORT` 改成 `8188`，直接用 ComfyUI 原生 `/prompt`、`/history`、`/view`。",
+    "- **用私有域名还是临时域名？** 隧道 Cell 按 **Secret 是否存在**自动二选一："
+    "有 `CF_TUNNEL_TOKEN`（且本笔记本已授权、token 可解析）→ 启动 Named Tunnel，"
+    "验证 `qwythos.gmhqyj.ccwu.cc/health` 后打印固定域名与 `/v1/images/generations`；"
+    "没有 / 未授权 / token 无效 / 固定域名验证失败 → 自动回退 quick tunnel 打印 `trycloudflare.com` 临时域名。"
+    "Secret 是按笔记本授权的，用 GitHub 链接打开的新笔记本要重新开启访问权限。",
+    "- **两个会话抢同一隧道？** 同一 Named Tunnel token 只能一个 Colab 会话连接，同时连会 502 / 1033；"
+    "需要换会话时跑「强制接管」Cell 清掉旧连接。",
+    "- **固定私有域名：** Cloudflare Named Tunnel 上已配两条 Public Hostname：",
+    "  `qwythos.gmhqyj.ccwu.cc` → `localhost:8010`（OpenAI 兼容接口），",
+    "  `comfy.gmhqyj.ccwu.cc` → `localhost:8188`（ComfyUI Web UI / 原生 API）。",
+    "  两者都无鉴权，建议加 Cloudflare Access；若本地打不开先换网络/代理试，域名侧返回 200 即为链路问题。",
+    "- **接口风格：** 保留 OpenAI `images.generate` 兼容；`b64_json` 直接解码为图片。",
+    "- **测速指标：** 测试 Cell 打印单图端到端耗时（含 ComfyUI 排队与去噪），可用于对比不同量化版本。",
+    "- **新域名自检报 `gaierror(-2, Name or service not known)`？** quick tunnel 域名刚生成时 DNS 还没传播，",
+    "  不是服务挂了；等 30–60 秒重跑验证即可，可选单元格已内置 3 次重试。",
+    "- **本机打不开固定域名？** 部分网络会在 TLS 握手阶段阻断 `*.gmhqyj.ccwu.cc`，从 Colab / 其它外网出口",
+    "  却能正常 200；用可选单元格给出的 `trycloudflare.com` 临时域名，或换网络 / 调整代理规则。",
+)
+
+with open("/Users/apple/WorkBuddy/2026-11-15-20-29-14/Qwen-Image-2.1-Turbo-Colab.ipynb", "w") as f:
+    json.dump(nb, f, ensure_ascii=False, indent=1)
+print("写入 Qwen-Image-2.1-Turbo-Colab.ipynb，共", len(nb["cells"]), "个 Cell")
